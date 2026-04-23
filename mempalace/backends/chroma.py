@@ -3,7 +3,9 @@
 import datetime as _dt
 import logging
 import os
+import pickle
 import sqlite3
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Optional
 
@@ -534,6 +536,74 @@ def _pin_hnsw_threads(collection) -> None:
 _BLOB_FIX_MARKER = ".blob_seq_ids_migrated"
 
 
+def _valid_dimensionality(value: object) -> bool:
+    return isinstance(value, Integral) and not isinstance(value, bool) and int(value) > 0
+
+
+def _persisted_metadata_fields(obj: object) -> tuple[object, object]:
+    if isinstance(obj, dict):
+        return obj.get("dimensionality"), obj.get("id_to_label")
+    return getattr(obj, "dimensionality", None), getattr(obj, "id_to_label", None)
+
+
+def quarantine_invalid_hnsw_metadata(palace_path: str) -> list[str]:
+    """Quarantine segment dirs whose ``index_metadata.pickle`` is unreadable or invalid.
+
+    Chroma's persisted HNSW metadata is untrusted disk state. If a segment has
+    labels but no valid positive dimensionality, current Chroma versions can
+    accept the pickle and crash later in the Rust loader. We rename the entire
+    segment out of the way before ``PersistentClient`` opens so Chroma can
+    rebuild cleanly instead of touching known-bad metadata.
+    """
+    try:
+        entries = os.listdir(palace_path)
+    except OSError:
+        return []
+
+    moved: list[str] = []
+    for name in entries:
+        if "-" not in name or name.startswith(".") or ".drift-" in name or ".corrupt-" in name:
+            continue
+        seg_dir = os.path.join(palace_path, name)
+        if not os.path.isdir(seg_dir):
+            continue
+
+        meta_path = os.path.join(seg_dir, "index_metadata.pickle")
+        if not os.path.isfile(meta_path):
+            continue
+
+        reason = None
+        try:
+            with open(meta_path, "rb") as f:
+                persisted = pickle.load(f)
+        except Exception as exc:
+            reason = f"unreadable index_metadata.pickle: {exc}"
+        else:
+            dimensionality, id_to_label = _persisted_metadata_fields(persisted)
+            has_labels = bool(id_to_label)
+            if has_labels and not _valid_dimensionality(dimensionality):
+                reason = (
+                    "labels present but dimensionality is missing or invalid "
+                    f"({dimensionality!r})"
+                )
+            elif dimensionality is not None and not _valid_dimensionality(dimensionality):
+                reason = f"invalid dimensionality {dimensionality!r}"
+
+        if reason is None:
+            continue
+
+        stamp = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = f"{seg_dir}.corrupt-{stamp}"
+        try:
+            os.rename(seg_dir, target)
+            moved.append(target)
+            logger.warning("Quarantined invalid HNSW metadata in %s: %s", seg_dir, reason)
+        except OSError:
+            logger.exception("Failed to quarantine invalid HNSW metadata in %s", seg_dir)
+
+    return moved
+
+
 def _fix_blob_seq_ids(palace_path: str) -> None:
     """Fix ChromaDB 0.6.x -> 1.5.x migration bug: BLOB seq_ids -> INTEGER.
 
@@ -937,6 +1007,8 @@ class ChromaBackend(BaseBackend):
 
         if cached is None or inode_changed or mtime_changed or mtime_appeared:
             _fix_blob_seq_ids(palace_path)
+            quarantine_invalid_hnsw_metadata(palace_path)
+            quarantine_stale_hnsw(palace_path)
             cached = chromadb.PersistentClient(path=palace_path)
             self._clients[palace_path] = cached
             # Re-stat after the client constructor runs: chromadb creates
@@ -985,6 +1057,7 @@ class ChromaBackend(BaseBackend):
         """
         _fix_blob_seq_ids(palace_path)
         if palace_path not in ChromaBackend._quarantined_paths:
+            quarantine_invalid_hnsw_metadata(palace_path)
             quarantine_stale_hnsw(palace_path)
             ChromaBackend._quarantined_paths.add(palace_path)
         return chromadb.PersistentClient(path=palace_path)

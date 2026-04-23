@@ -41,6 +41,7 @@ from .backends.chroma import ChromaBackend, hnsw_capacity_status
 
 
 COLLECTION_NAME = "mempalace_drawers"
+REPAIR_TEMP_COLLECTION = f"{COLLECTION_NAME}__repair_tmp"
 
 
 def _get_palace_path():
@@ -81,6 +82,79 @@ def _paginate_ids(col, where=None):
         if n < page:
             break
     return ids
+
+
+def _extract_drawers(col, total: int, batch_size: int):
+    all_ids = []
+    all_docs = []
+    all_metas = []
+    offset = 0
+    while offset < total:
+        batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
+        if not batch["ids"]:
+            break
+        all_ids.extend(batch["ids"])
+        all_docs.extend(batch["documents"])
+        all_metas.extend(batch["metadatas"])
+        offset += len(batch["ids"])
+    return all_ids, all_docs, all_metas
+
+
+def _verify_collection_count(col, expected: int, label: str) -> None:
+    actual = col.count()
+    if actual != expected:
+        raise RuntimeError(f"{label} count mismatch: expected {expected}, got {actual}")
+
+
+def _delete_collection_if_exists(backend, palace_path: str, collection_name: str) -> None:
+    try:
+        backend.delete_collection(palace_path, collection_name)
+    except Exception:
+        pass
+
+
+def _rebuild_collection_via_temp(
+    backend,
+    palace_path: str,
+    all_ids,
+    all_docs,
+    all_metas,
+    batch_size: int,
+    progress=print,
+) -> int:
+    expected = len(all_ids)
+    temp_name = REPAIR_TEMP_COLLECTION
+
+    _delete_collection_if_exists(backend, palace_path, temp_name)
+
+    progress(f"  Building temporary collection: {temp_name}")
+    temp_col = backend.create_collection(palace_path, temp_name)
+    staged = 0
+    for i in range(0, expected, batch_size):
+        batch_ids = all_ids[i : i + batch_size]
+        batch_docs = all_docs[i : i + batch_size]
+        batch_metas = all_metas[i : i + batch_size]
+        temp_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
+        staged += len(batch_ids)
+        progress(f"  Staged {staged}/{expected} drawers...")
+    _verify_collection_count(temp_col, expected, "temporary rebuild")
+
+    progress("  Rebuilding live collection...")
+    backend.delete_collection(palace_path, COLLECTION_NAME)
+    new_col = backend.create_collection(palace_path, COLLECTION_NAME)
+
+    rebuilt = 0
+    for i in range(0, expected, batch_size):
+        batch_ids = all_ids[i : i + batch_size]
+        batch_docs = all_docs[i : i + batch_size]
+        batch_metas = all_metas[i : i + batch_size]
+        new_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
+        rebuilt += len(batch_ids)
+        progress(f"  Re-filed {rebuilt}/{expected} drawers...")
+    _verify_collection_count(new_col, expected, "rebuilt live collection")
+
+    _delete_collection_if_exists(backend, palace_path, temp_name)
+    return rebuilt
 
 
 def scan_palace(palace_path=None, only_wing=None):
@@ -373,18 +447,7 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
     # Extract all drawers in batches
     print("\n  Extracting drawers...")
     batch_size = 5000
-    all_ids = []
-    all_docs = []
-    all_metas = []
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
-        if not batch["ids"]:
-            break
-        all_ids.extend(batch["ids"])
-        all_docs.extend(batch["documents"])
-        all_metas.extend(batch["metadatas"])
-        offset += len(batch["ids"])
+    all_ids, all_docs, all_metas = _extract_drawers(col, total, batch_size)
     print(f"  Extracted {len(all_ids)} drawers")
 
     # ── #1208 guard ──────────────────────────────────────────────────
@@ -407,21 +470,19 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
 
     # Rebuild with correct HNSW settings
     print("  Rebuilding collection with hnsw:space=cosine...")
-    backend.delete_collection(palace_path, COLLECTION_NAME)
-    new_col = backend.create_collection(palace_path, COLLECTION_NAME)
-
-    filed = 0
     try:
-        for i in range(0, len(all_ids), batch_size):
-            batch_ids = all_ids[i : i + batch_size]
-            batch_docs = all_docs[i : i + batch_size]
-            batch_metas = all_metas[i : i + batch_size]
-            new_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
-            filed += len(batch_ids)
-            print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
+        filed = _rebuild_collection_via_temp(
+            backend,
+            palace_path,
+            all_ids,
+            all_docs,
+            all_metas,
+            batch_size,
+            progress=print,
+        )
     except Exception as e:
         print(f"\n  ERROR during rebuild: {e}")
-        print(f"  Only {filed}/{len(all_ids)} drawers were re-filed.")
+        print("  Rebuild aborted before completion.")
         if os.path.exists(backup_path):
             print(f"  Restoring from backup: {backup_path}")
             backend.delete_collection(palace_path, COLLECTION_NAME)

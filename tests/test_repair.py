@@ -2,7 +2,7 @@
 
 import os
 import sqlite3
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -229,8 +229,11 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
     }
 
     mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
     mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
-    mock_backend.create_collection.return_value = mock_new_col
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
 
     repair.rebuild_index(palace_path=str(tmp_path))
 
@@ -239,10 +242,18 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
     assert "chroma.sqlite3" in str(mock_shutil.copy2.call_args)
 
     # Verify: deleted and recreated (cosine is the backend default)
-    mock_backend.delete_collection.assert_called_once_with(str(tmp_path), "mempalace_drawers")
-    mock_backend.create_collection.assert_called_once_with(str(tmp_path), "mempalace_drawers")
+    assert mock_backend.create_collection.call_args_list == [
+        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
+        call(str(tmp_path), "mempalace_drawers"),
+    ]
+    assert mock_backend.delete_collection.call_args_list == [
+        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
+        call(str(tmp_path), "mempalace_drawers"),
+        call(str(tmp_path), "mempalace_drawers__repair_tmp"),
+    ]
 
     # Verify: used upsert not add
+    mock_temp_col.upsert.assert_called_once()
     mock_new_col.upsert.assert_called_once()
     mock_new_col.add.assert_not_called()
 

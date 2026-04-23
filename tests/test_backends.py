@@ -1,6 +1,8 @@
 import os
+import pickle
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
 import chromadb
 import pytest
@@ -18,6 +20,7 @@ from mempalace.backends.chroma import (
     ChromaCollection,
     _fix_blob_seq_ids,
     _pin_hnsw_threads,
+    quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
 )
 
@@ -785,3 +788,65 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     )
 
     assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
+
+
+def test_quarantine_invalid_hnsw_metadata_renames_missing_dimensionality(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump({"dimensionality": None, "id_to_label": {"a": 1}}, f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_allows_uninitialized_segment(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    with open(seg / "index_metadata.pickle", "wb") as f:
+        pickle.dump(SimpleNamespace(dimensionality=None, id_to_label={}), f)
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    calls = []
+
+    def _record(name):
+        def inner(path, *args, **kwargs):
+            calls.append((name, path))
+            return [] if name != "blob" else None
+
+        return inner
+
+    monkeypatch.setattr("mempalace.backends.chroma._fix_blob_seq_ids", _record("blob"))
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata", _record("invalid")
+    )
+    monkeypatch.setattr("mempalace.backends.chroma.quarantine_stale_hnsw", _record("stale"))
+
+    class DummyClient:
+        pass
+
+    monkeypatch.setattr("mempalace.backends.chroma.chromadb.PersistentClient", lambda path: DummyClient())
+
+    backend = ChromaBackend()
+    backend._client(str(palace))
+
+    assert calls == [
+        ("blob", str(palace)),
+        ("invalid", str(palace)),
+        ("stale", str(palace)),
+    ]

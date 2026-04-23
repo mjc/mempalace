@@ -4,7 +4,7 @@ import argparse
 import shlex
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -760,13 +760,25 @@ def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
         "documents": ["doc1", "doc2"],
         "metadatas": [{"wing": "a"}, {"wing": "b"}],
     }
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
     mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 2
     mock_backend = _mock_backend_for(col=mock_col, new_col=mock_new_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
     with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
         cmd_repair(args)
     out = capsys.readouterr().out
     assert "Repair complete" in out
     assert "2 drawers rebuilt" in out
+    assert mock_backend.delete_collection.call_args_list == [
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+        call(str(palace_dir), "mempalace_drawers"),
+        call(str(palace_dir), "mempalace_drawers__repair_tmp"),
+    ]
+    mock_temp_col.upsert.assert_called_once()
+    mock_new_col.upsert.assert_called_once()
+    mock_new_col.add.assert_not_called()
 
 
 @patch("mempalace.cli.MempalaceConfig")
