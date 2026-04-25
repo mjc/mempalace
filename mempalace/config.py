@@ -94,6 +94,8 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_EMBEDDING_BACKEND = "auto"
+DEFAULT_EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -309,6 +311,37 @@ class MempalaceConfig:
                 json.dump(self._file_config, f, indent=2, ensure_ascii=False)
         except OSError:
             pass
+
+    @property
+    def embedding_backend(self):
+        """Which embedding backend ChromaBackend should use.
+
+        One of: auto, onnx_default, onnx_cpu, st_cpu, st_mps.
+        Default: "auto" picks the best available runtime path and falls
+        back to ChromaDB's default ONNX embedding function if optional
+        backend dependencies are unavailable.
+        """
+        env_val = os.environ.get("MEMPAL_EMBED_BACKEND") or os.environ.get(
+            "MEMPALACE_EMBED_BACKEND"
+        )
+        if env_val:
+            return env_val
+        return self._file_config.get("embedding_backend", DEFAULT_EMBEDDING_BACKEND)
+
+    @property
+    def embedding_model(self):
+        """HuggingFace model identifier for the embedding backend.
+
+        Default: "all-MiniLM-L6-v2", matching ChromaDB's bundled ONNX
+        model. Changing this requires re-mining because embeddings become
+        incompatible.
+        """
+        env_val = os.environ.get("MEMPAL_EMBED_MODEL") or os.environ.get(
+            "MEMPALACE_EMBED_MODEL"
+        )
+        if env_val:
+            return env_val
+        return self._file_config.get("embedding_model", DEFAULT_EMBEDDING_MODEL)
 
     def init(self):
         """Create config directory and write default config.json if it doesn't exist."""

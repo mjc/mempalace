@@ -1176,6 +1176,19 @@ class ChromaBackend(BaseBackend):
         return ChromaCollection(collection)
 
 
+def _get_configured_embedding_function():
+    """Return configured embedding function, or None for ChromaDB default."""
+    try:
+        from mempalace.config import MempalaceConfig
+        from mempalace.embedding import get_embedding_function
+
+        cfg = MempalaceConfig()
+        return get_embedding_function(cfg.embedding_backend, cfg.embedding_model)
+    except Exception as exc:
+        logger.warning("falling back to ChromaDB default embedding function: %s", exc)
+        return None
+
+
 def _normalize_get_collection_args(args, kwargs):
     """Unify legacy positional ``(palace_path, collection_name, create)`` calls
     with the new kwargs-only ``(palace=PalaceRef, collection_name=..., create=...)``.
