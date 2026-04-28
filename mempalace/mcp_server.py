@@ -834,6 +834,12 @@ def tool_add_drawer(
                 }
             ],
         )
+        inserted = col.get(ids=[drawer_id])
+        if not inserted or not inserted["ids"]:
+            raise RuntimeError(
+                "Drawer write was acknowledged but the new ID is not readable. "
+                "The palace index may be stale; run reconnect or repair."
+            )
         _metadata_cache = None
         logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
@@ -1324,6 +1330,13 @@ def tool_reconnect():
         _palace_db_mtime, \
         _vector_disabled, \
         _vector_disabled_reason
+    from . import palace as palace_module
+
+    if _client_cache is not None:
+        try:
+            _client_cache.close()
+        except Exception:
+            pass
     _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
@@ -1333,6 +1346,10 @@ def tool_reconnect():
     # still applies after the reconnect.
     _vector_disabled = False
     _vector_disabled_reason = ""
+    try:
+        palace_module._DEFAULT_BACKEND.close_palace(_config.palace_path)
+    except Exception:
+        pass
     try:
         col = _get_collection()
         if col is None:

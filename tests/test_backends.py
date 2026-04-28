@@ -3,6 +3,7 @@ import pickle
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import chromadb
 import pytest
@@ -23,6 +24,7 @@ from mempalace.backends.chroma import (
     quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
 )
+from mempalace import palace as palace_module
 
 
 class _FakeCollection:
@@ -850,3 +852,32 @@ def test_chroma_backend_preflights_metadata_before_persistent_client(tmp_path, m
         ("invalid", str(palace)),
         ("stale", str(palace)),
     ]
+def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
+    captured = {}
+
+    fake_backend = MagicMock()
+
+    def fake_get_collection(palace_path, collection_name=None, create=False):
+        captured["palace_path"] = palace_path
+        captured["collection_name"] = collection_name
+        captured["create"] = create
+        return "ok"
+
+    fake_backend.get_collection.side_effect = fake_get_collection
+    monkeypatch.setattr(palace_module, "_DEFAULT_BACKEND", fake_backend)
+
+    class _FakeConfig:
+        @property
+        def collection_name(self):
+            return "custom_drawers"
+
+    monkeypatch.setattr("mempalace.config.MempalaceConfig", _FakeConfig)
+
+    result = palace_module.get_collection("/tmp/palace", create=False)
+
+    assert result == "ok"
+    assert captured == {
+        "palace_path": "/tmp/palace",
+        "collection_name": "custom_drawers",
+        "create": False,
+    }

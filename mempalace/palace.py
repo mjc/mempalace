@@ -52,10 +52,14 @@ NORMALIZE_VERSION = 2
 
 def get_collection(
     palace_path: str,
-    collection_name: str = "mempalace_drawers",
+    collection_name: str = None,
     create: bool = True,
 ):
     """Get the palace collection through the backend layer."""
+    if collection_name is None:
+        from .config import MempalaceConfig
+
+        collection_name = MempalaceConfig().collection_name
     return _DEFAULT_BACKEND.get_collection(
         palace_path,
         collection_name=collection_name,

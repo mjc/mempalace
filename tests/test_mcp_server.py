@@ -9,6 +9,7 @@ via monkeypatch to avoid touching real data.
 from datetime import datetime
 import json
 import sys
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -457,6 +458,28 @@ class TestWriteTools:
         assert result2["success"] is True
         assert result2["reason"] == "already_exists"
 
+    def test_add_drawer_fails_when_post_write_read_cannot_find_id(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class _FakeCol:
+            def __init__(self):
+                self.get_calls = 0
+
+            def get(self, **kwargs):
+                self.get_calls += 1
+                return {"ids": []}
+
+            def upsert(self, **kwargs):
+                return None
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: _FakeCol())
+
+        result = mcp_server.tool_add_drawer(wing="w", room="r", content="hello world")
+
+        assert result["success"] is False
+        assert "not readable" in result["error"]
+
     def test_add_drawer_shared_header_no_collision(self, monkeypatch, config, palace_path, kg):
         """Documents sharing a >100-char header must get distinct IDs (full-content hash)."""
         _patch_mcp_server(monkeypatch, config, kg)
@@ -874,3 +897,21 @@ class TestCacheInvalidation:
         assert result["success"] is True
         assert "Reconnected" in result["message"]
         assert isinstance(result["drawers"], int)
+
+    def test_reconnect_closes_shared_palace_backend(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace import palace as palace_module
+
+        close_palace = MagicMock()
+        monkeypatch.setattr(palace_module._DEFAULT_BACKEND, "close_palace", close_palace)
+        monkeypatch.setattr(
+            mcp_server,
+            "_get_collection",
+            lambda create=False: MagicMock(count=lambda: 0),
+        )
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is True
+        close_palace.assert_called_once_with(config.palace_path)
