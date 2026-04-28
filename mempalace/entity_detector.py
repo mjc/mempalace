@@ -39,6 +39,7 @@ from pathlib import Path
 from collections import defaultdict
 
 from mempalace.i18n import get_entity_patterns
+from mempalace.readable_extensions import ENTITY_DETECTOR_READABLE_EXTENSIONS
 
 
 # ==================== LANGUAGE-AWARE PATTERN LOADING ====================
@@ -88,56 +89,7 @@ PROSE_EXTENSIONS = {
     ".csv",
 }
 
-READABLE_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".py",
-    ".js",
-    ".ts",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".csv",
-    ".rst",
-    ".toml",
-    ".sh",
-    ".rb",
-    ".c",
-    ".cc",
-    ".cpp",
-    ".cxx",
-    ".h",
-    ".hh",
-    ".hpp",
-    ".hxx",
-    ".ipp",
-    ".inl",
-    ".m",
-    ".mm",
-    ".cs",
-    ".csproj",
-    ".props",
-    ".sln",
-    ".vcxproj",
-    ".kt",
-    ".kts",
-    ".erl",
-    ".hrl",
-    ".nix",
-    ".cmake",
-    ".gn",
-    ".gni",
-    ".proto",
-    ".ps1",
-    ".mdx",
-    ".patch",
-    ".ex",
-    ".exs",
-    ".eex",
-    ".heex",
-    ".go",
-    ".rs",
-}
+READABLE_EXTENSIONS = ENTITY_DETECTOR_READABLE_EXTENSIONS
 
 SKIP_DIRS = {
     ".git",
