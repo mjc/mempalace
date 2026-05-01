@@ -9,8 +9,11 @@ via monkeypatch to avoid touching real data.
 from datetime import datetime
 import json
 import sys
+from unittest.mock import MagicMock
 
 import pytest
+
+from mempalace.backends.base import GetResult
 
 
 def _patch_mcp_server(monkeypatch, config, kg):
@@ -456,6 +459,33 @@ class TestWriteTools:
         result2 = tool_add_drawer(wing="w", room="r", content=content)
         assert result2["success"] is True
         assert result2["reason"] == "already_exists"
+
+    def test_add_drawer_fails_when_post_write_read_cannot_find_id(self, monkeypatch, config, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+
+        class _FakeCol:
+            def __init__(self):
+                self.get_calls = []
+
+            def get(self, **kwargs):
+                self.get_calls.append(kwargs)
+                return GetResult.empty()
+
+            def upsert(self, **kwargs):
+                return None
+
+        fake_col = _FakeCol()
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: fake_col)
+
+        result = mcp_server.tool_add_drawer(wing="w", room="r", content="hello world")
+
+        assert result["success"] is False
+        assert "not readable" in result["error"]
+        assert len(fake_col.get_calls) == 2
+        assert fake_col.get_calls[0]["include"] == []
+        assert fake_col.get_calls[1]["include"] == []
+        assert fake_col.get_calls[0]["ids"] == fake_col.get_calls[1]["ids"]
 
     def test_add_drawer_shared_header_no_collision(self, monkeypatch, config, palace_path, kg):
         """Documents sharing a >100-char header must get distinct IDs (full-content hash)."""
@@ -975,3 +1005,94 @@ class TestCacheInvalidation:
         for kwargs in captured["get"]:
             assert "embedding_function" in kwargs
             assert kwargs["embedding_function"] is not None
+
+    def test_reconnect_clears_shared_system_cache(self, monkeypatch, config, palace_path, kg):
+        _patch_mcp_server(monkeypatch, config, kg)
+        import chromadb.api.client as chroma_client
+
+        from mempalace import mcp_server
+        from mempalace import palace as palace_module
+
+        close_palace = MagicMock()
+        clear_system_cache = MagicMock()
+        monkeypatch.setattr(palace_module._DEFAULT_BACKEND, "close_palace", close_palace)
+        monkeypatch.setattr(
+            chroma_client.SharedSystemClient,
+            "clear_system_cache",
+            clear_system_cache,
+        )
+        monkeypatch.setattr(
+            mcp_server,
+            "_get_collection",
+            lambda create=False: MagicMock(count=lambda: 0),
+        )
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is True
+        close_palace.assert_called_once_with(config.palace_path)
+        clear_system_cache.assert_called_once()
+
+    def test_reconnect_treats_missing_clear_system_cache_as_best_effort(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        import chromadb.api.client as chroma_client
+
+        from mempalace import mcp_server
+        from mempalace import palace as palace_module
+
+        close_palace = MagicMock()
+        monkeypatch.setattr(palace_module._DEFAULT_BACKEND, "close_palace", close_palace)
+        monkeypatch.delattr(chroma_client.SharedSystemClient, "clear_system_cache", raising=False)
+        monkeypatch.setattr(
+            mcp_server,
+            "_get_collection",
+            lambda create=False: MagicMock(count=lambda: 0),
+        )
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is True
+        close_palace.assert_called_once_with(config.palace_path)
+
+    def test_reconnect_reports_failure_when_handle_close_fails(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace import palace as palace_module
+
+        close_palace = MagicMock(side_effect=RuntimeError("close failed"))
+        monkeypatch.setattr(palace_module._DEFAULT_BACKEND, "close_palace", close_palace)
+        monkeypatch.setattr(
+            mcp_server,
+            "_get_collection",
+            lambda create=False: MagicMock(count=lambda: 0),
+        )
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is False
+        assert "failed to fully reset cached handles" in result["message"]
+        assert "close_palace failed" in result["error"]
+
+    def test_reconnect_surfaces_close_errors_when_no_palace(
+        self, monkeypatch, config, kg
+    ):
+        _patch_mcp_server(monkeypatch, config, kg)
+        from mempalace import mcp_server
+        from mempalace import palace as palace_module
+
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda create=False: None)
+        monkeypatch.setattr(
+            palace_module._DEFAULT_BACKEND,
+            "close_palace",
+            MagicMock(side_effect=RuntimeError("close failed")),
+        )
+
+        result = mcp_server.tool_reconnect()
+
+        assert result["success"] is False
+        assert "No palace found" in result["message"]
+        assert "close_palace failed" in result["error"]

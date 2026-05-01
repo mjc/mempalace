@@ -650,8 +650,10 @@ def cmd_repair(args):
     from .migrate import confirm_destructive_action, contains_palace_database
     from .repair import TruncationDetected, check_extraction_safety
 
+    config = MempalaceConfig()
+    collection_name = config.collection_name
     palace_path = os.path.abspath(
-        os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+        os.path.expanduser(args.palace) if args.palace else config.palace_path
     )
 
     if getattr(args, "mode", "legacy") == "max-seq-id":
@@ -685,7 +687,7 @@ def cmd_repair(args):
 
     # Try to read existing drawers
     try:
-        col = backend.get_collection(palace_path, "mempalace_drawers")
+        col = backend.get_collection(palace_path, collection_name)
         total = col.count()
         print(f"  Drawers found: {total}")
     except Exception as e:
@@ -731,6 +733,7 @@ def cmd_repair(args):
             palace_path,
             len(all_ids),
             confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+            collection_name=collection_name,
         )
     except TruncationDetected as e:
         print(e.message)
@@ -750,22 +753,52 @@ def cmd_repair(args):
     print(f"  Backing up to {backup_path}...")
     shutil.copytree(palace_path, backup_path)
 
-    print("  Rebuilding collection...")
-    backend.delete_collection(palace_path, "mempalace_drawers")
-    new_col = backend.create_collection(palace_path, "mempalace_drawers")
+    try:
+        print("  Rebuilding collection...")
+        backend.delete_collection(palace_path, collection_name)
+        new_col = backend.create_collection(palace_path, collection_name)
+        filed = 0
+        for i in range(0, len(all_ids), batch_size):
+            batch_ids = all_ids[i : i + batch_size]
+            batch_docs = all_docs[i : i + batch_size]
+            batch_metas = all_metas[i : i + batch_size]
+            new_col.add(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
+            filed += len(batch_ids)
+            print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
+    except Exception as e:
+        print(f"\n  ERROR during rebuild: {e}")
+        print("  Rebuild aborted before completion.")
+        if os.path.exists(backup_path):
+            print(f"  Restoring from backup: {backup_path}")
+            try:
+                backend.close_palace(palace_path)
+            except Exception as close_error:
+                print(f"  Warning: failed to close active Chroma backend before restore: {close_error}")
+            try:
+                from .repair import _close_chroma_handles
 
-    filed = 0
-    for i in range(0, len(all_ids), batch_size):
-        batch_ids = all_ids[i : i + batch_size]
-        batch_docs = all_docs[i : i + batch_size]
-        batch_metas = all_metas[i : i + batch_size]
-        new_col.add(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
-        filed += len(batch_ids)
-        print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
+                _close_chroma_handles(palace_path)
+            except Exception as close_error:
+                print(f"  Warning: failed to close Chroma handles before restore: {close_error}")
+            try:
+                if os.path.exists(palace_path):
+                    shutil.rmtree(palace_path)
+                shutil.copytree(backup_path, palace_path)
+                print("  Backup restored. Palace is back to pre-repair state.")
+            except Exception as restore_error:
+                print(f"  Automatic restore failed: {restore_error}")
+                print("  Manual recovery required:")
+                print(f"    1. Remove or rename the broken directory: {palace_path}")
+                print(f"    2. Restore the backup directory to: {palace_path}")
+                print(f"       Backup location: {backup_path}")
+        else:
+            print("  No backup available. Re-mine from source files to recover.")
+        sys.exit(1)
 
     print(f"\n  Repair complete. {filed} drawers rebuilt.")
     print(f"  Backup saved at {backup_path}")
     print(f"\n{'=' * 55}\n")
+
 
 
 def cmd_hook(args):

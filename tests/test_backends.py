@@ -1,6 +1,8 @@
 import os
+import pickle
 import sqlite3
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import chromadb
 import pytest
@@ -18,8 +20,10 @@ from mempalace.backends.chroma import (
     ChromaCollection,
     _fix_blob_seq_ids,
     _pin_hnsw_threads,
+    quarantine_invalid_hnsw_metadata,
     quarantine_stale_hnsw,
 )
+from mempalace import palace as palace_module
 
 
 class _FakeCollection:
@@ -701,6 +705,168 @@ def test_quarantine_stale_hnsw_skips_already_quarantined(tmp_path):
     assert drift.exists()
 
 
+# ── quarantine_invalid_hnsw_metadata ────────────────────────────────────────
+
+
+def _make_segment_with_metadata(tmp_path, state):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    (palace / "chroma.sqlite3").write_text("")
+    seg = palace / "abcd-1234-5678"
+    seg.mkdir()
+    if isinstance(state, bytes):
+        (seg / "index_metadata.pickle").write_bytes(state)
+    else:
+        with open(seg / "index_metadata.pickle", "wb") as f:
+            pickle.dump(state, f, pickle.HIGHEST_PROTOCOL)
+    return palace, seg
+
+
+def test_quarantine_invalid_hnsw_metadata_renames_segment_with_labels_and_missing_dim(
+    tmp_path,
+):
+    palace, seg = _make_segment_with_metadata(
+        tmp_path,
+        {"dimensionality": None, "id_to_label": {"id1": 1}},
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+    assert (Path(moved[0]) / "index_metadata.pickle").exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_rejects_bool_dimensionality(tmp_path):
+    palace, seg = _make_segment_with_metadata(
+        tmp_path,
+        {"dimensionality": True, "id_to_label": {"id1": 1}},
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_leaves_valid_segment_alone(tmp_path):
+    palace, seg = _make_segment_with_metadata(
+        tmp_path,
+        {"dimensionality": 384, "id_to_label": {"id1": 1}},
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_allows_uninitialized_segment(tmp_path):
+    palace, seg = _make_segment_with_metadata(
+        tmp_path,
+        {"dimensionality": None, "id_to_label": {}},
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_rejects_non_dict_id_to_label(tmp_path):
+    palace, seg = _make_segment_with_metadata(
+        tmp_path,
+        {"dimensionality": 8, "id_to_label": ["a", "b"]},
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_rejects_non_schema_payload(tmp_path):
+    palace, seg = _make_segment_with_metadata(tmp_path, ["not", "a", "metadata", "object"])
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def _dangerous_pickle_payload_executed():
+    raise AssertionError("unsafe pickle payload executed")
+
+
+class _DangerousPickle:
+    def __reduce__(self):
+        return (_dangerous_pickle_payload_executed, ())
+
+
+def test_quarantine_invalid_hnsw_metadata_rejects_unsafe_pickle(tmp_path):
+    palace, seg = _make_segment_with_metadata(tmp_path, _DangerousPickle())
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_skips_transient_read_errors(
+    tmp_path, monkeypatch
+):
+    palace, seg = _make_segment_with_metadata(tmp_path, b"partial")
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(OSError("flush in progress")),
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert moved == []
+    assert seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_quarantines_eof_truncated_pickle(
+    tmp_path, monkeypatch
+):
+    palace, seg = _make_segment_with_metadata(tmp_path, b"")
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(EOFError("ran out of input")),
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
+def test_quarantine_invalid_hnsw_metadata_quarantines_truncated_pickle(tmp_path, monkeypatch):
+    palace, seg = _make_segment_with_metadata(tmp_path, b"partial")
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma._SafePersistentDataUnpickler.load",
+        lambda path: (_ for _ in ()).throw(
+            pickle.UnpicklingError("pickle data was truncated")
+        ),
+    )
+
+    moved = quarantine_invalid_hnsw_metadata(str(palace))
+
+    assert len(moved) == 1
+    assert ".corrupt-" in moved[0]
+    assert not seg.exists()
+
+
 # ── make_client cold-start gate ──────────────────────────────────────────
 
 
@@ -764,6 +930,57 @@ def test_make_client_quarantines_each_palace_independently(tmp_path, monkeypatch
     assert calls == [palace_a, palace_b]
 
 
+def test_chroma_client_rechecks_invalid_metadata_on_refresh(tmp_path, monkeypatch):
+    """Invalid metadata quarantine runs on every reconnect, even when stale-HNSW quarantine is gated."""
+    from mempalace.backends.chroma import ChromaBackend
+
+    palace_path = str(tmp_path / "palace")
+    os.makedirs(palace_path, exist_ok=True)
+    db_path = Path(palace_path) / "chroma.sqlite3"
+    db_path.write_text("")
+
+    monkeypatch.setattr(ChromaBackend, "_quarantined_paths", set())
+
+    calls: list[tuple[str, str]] = []
+
+    def _record(name):
+        def inner(path, *args, **kwargs):
+            calls.append((name, path))
+            return []
+
+        return inner
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.quarantine_invalid_hnsw_metadata",
+        _record("invalid"),
+    )
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.quarantine_stale_hnsw",
+        _record("stale"),
+    )
+
+    class DummyClient:
+        pass
+
+    monkeypatch.setattr(
+        "mempalace.backends.chroma.chromadb.PersistentClient",
+        lambda path: DummyClient(),
+    )
+
+    backend = ChromaBackend()
+    first = backend._client(palace_path)
+    st = db_path.stat()
+    os.utime(db_path, (st.st_atime + 10, st.st_mtime + 10))
+    second = backend._client(palace_path)
+
+    assert first is not second
+    assert calls == [
+        ("invalid", palace_path),
+        ("stale", palace_path),
+        ("invalid", palace_path),
+    ]
+
+
 # ── _pin_hnsw_threads (per-process retrofit, separate from this PR's gate) ──
 
 
@@ -811,3 +1028,34 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     )
 
     assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
+
+
+def test_palace_get_collection_uses_configured_collection_name(monkeypatch):
+    captured = {}
+
+    fake_backend = MagicMock()
+
+    def fake_get_collection(palace_path, collection_name=None, create=False):
+        captured["palace_path"] = palace_path
+        captured["collection_name"] = collection_name
+        captured["create"] = create
+        return "ok"
+
+    fake_backend.get_collection.side_effect = fake_get_collection
+    monkeypatch.setattr(palace_module, "_DEFAULT_BACKEND", fake_backend)
+
+    class _FakeConfig:
+        @property
+        def collection_name(self):
+            return "custom_drawers"
+
+    monkeypatch.setattr("mempalace.config.MempalaceConfig", _FakeConfig)
+
+    result = palace_module.get_collection("/tmp/palace", create=False)
+
+    assert result == "ok"
+    assert captured == {
+        "palace_path": "/tmp/palace",
+        "collection_name": "custom_drawers",
+        "create": False,
+    }

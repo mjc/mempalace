@@ -33,6 +33,7 @@ def _seed_chroma_db(
     sqlite_count: int,
     segment_id: str,
     sync_threshold: int | None = None,
+    collection_name: str = COLLECTION,
 ) -> None:
     """Create a minimal chroma.sqlite3 with one collection + VECTOR segment.
 
@@ -91,7 +92,7 @@ def _seed_chroma_db(
         )
         col_id = "col-test"
         meta_seg = "seg-meta"
-        conn.execute("INSERT INTO collections (id, name) VALUES (?, ?)", (col_id, COLLECTION))
+        conn.execute("INSERT INTO collections (id, name) VALUES (?, ?)", (col_id, collection_name))
         if sync_threshold is not None:
             conn.execute(
                 """INSERT INTO collection_metadata (collection_id, key, int_value)
@@ -238,14 +239,27 @@ def test_capacity_status_tolerates_flush_lag(tmp_path):
     assert info["status"] == "ok"
 
 
-def test_capacity_status_flags_unflushed_with_large_sqlite(tmp_path):
-    """No pickle + many sqlite rows is its own divergence signal."""
+def test_capacity_status_flags_missing_metadata_past_flush_tolerance(tmp_path):
+    """No pickle + enough sqlite rows routes search to BM25 fallback."""
     seg = "seg-noflush"
     _seed_chroma_db(str(tmp_path), sqlite_count=10_000, segment_id=seg)
     info = hnsw_capacity_status(str(tmp_path), COLLECTION)
     assert info["diverged"] is True
+    assert info["status"] == "diverged"
     assert info["hnsw_count"] is None
-    assert "never flushed" in info["message"]
+    assert info["divergence"] == 10_000
+    assert "BM25 fallback" in info["message"]
+
+
+def test_capacity_status_tolerates_missing_metadata_under_flush_tolerance(tmp_path):
+    """Small preflush collections can lack pickle metadata without being corrupt."""
+    seg = "seg-small-preflush"
+    _seed_chroma_db(str(tmp_path), sqlite_count=1_500, segment_id=seg)
+    info = hnsw_capacity_status(str(tmp_path), COLLECTION)
+    assert info["diverged"] is False
+    assert info["status"] == "unknown"
+    assert info["hnsw_count"] is None
+    assert "not yet flushed" in info["message"]
 
 
 def test_capacity_status_quiet_for_empty_palace(tmp_path):
@@ -417,6 +431,219 @@ def test_bm25_fallback_filters_by_wing(palace_with_drawers):
     assert all(r["wing"] == "design" for r in out["results"])
 
 
+def test_bm25_fallback_returns_empty_for_filtered_fts_miss(tmp_path):
+    """A scoped lexical miss should not return unrelated recent scoped drawers."""
+    seg = "seg-bm25-filtered-miss"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            (
+                "needle token outside target wing",
+                {"wing": "ops", "room": "incidents", "source_file": "/x/ops.md"},
+                "d-1",
+            ),
+            (
+                "recent but unrelated target wing drawer",
+                {"wing": "project", "room": "diary", "source_file": "/x/project.md"},
+                "d-2",
+            ),
+        ],
+    )
+
+    out = _bm25_only_via_sqlite("needle token", str(tmp_path), wing="project", n_results=5)
+
+    assert out["total_before_filter"] == 0
+    assert out["results"] == []
+
+
+def test_bm25_fallback_applies_wing_before_candidate_limit(tmp_path):
+    seg = "seg-bm25-limit"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=seg)
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            (
+                "shared token outside target wing",
+                {"wing": "ops", "room": "incidents", "source_file": "/x/ops.md"},
+                "d-1",
+            ),
+            (
+                "shared token inside target wing",
+                {"wing": "project", "room": "diary", "source_file": "/x/project.md"},
+                "d-2",
+            ),
+        ],
+    )
+
+    out = _bm25_only_via_sqlite("shared token", str(tmp_path), wing="project", max_candidates=1)
+
+    assert out["total_before_filter"] == 1
+    assert out["results"][0]["wing"] == "project"
+
+
+def test_bm25_fts_fallback_uses_configured_collection_name(tmp_path):
+    db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT NOT NULL, scope TEXT NOT NULL);
+            CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                segment_id TEXT NOT NULL,
+                embedding_id TEXT NOT NULL,
+                seq_id BLOB NOT NULL,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE embedding_metadata (
+                id INTEGER REFERENCES embeddings(id),
+                key TEXT NOT NULL,
+                string_value TEXT,
+                int_value INTEGER,
+                float_value REAL,
+                bool_value INTEGER,
+                PRIMARY KEY (id, key)
+            );
+            CREATE VIRTUAL TABLE embedding_fulltext_search
+                USING fts5(string_value, tokenize='trigram');
+            """
+        )
+        conn.execute("INSERT INTO collections (id, name) VALUES ('col-default', ?)", (COLLECTION,))
+        conn.execute("INSERT INTO collections (id, name) VALUES ('col-custom', 'custom_drawers')")
+        conn.execute(
+            "INSERT INTO segments (id, collection, scope) VALUES ('seg-default', 'col-default', 'VECTOR')"
+        )
+        conn.execute(
+            "INSERT INTO segments (id, collection, scope) VALUES ('seg-custom', 'col-custom', 'VECTOR')"
+        )
+        rows = [
+            (1, "seg-default", "d-default", "shared token wrong collection", "default"),
+            (2, "seg-custom", "d-custom", "shared token right collection", "custom"),
+        ]
+        for row_id, seg, eid, text, wing in rows:
+            conn.execute(
+                """INSERT INTO embeddings (id, segment_id, embedding_id, seq_id)
+                   VALUES (?, ?, ?, ?)""",
+                (row_id, seg, eid, b"\x00" * 8),
+            )
+            conn.execute(
+                """INSERT INTO embedding_metadata (id, key, string_value)
+                   VALUES (?, 'chroma:document', ?)""",
+                (row_id, text),
+            )
+            conn.execute(
+                """INSERT INTO embedding_fulltext_search (rowid, string_value)
+                   VALUES (?, ?)""",
+                (row_id, text),
+            )
+            conn.execute(
+                """INSERT INTO embedding_metadata (id, key, string_value)
+                   VALUES (?, 'wing', ?)""",
+                (row_id, wing),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = _bm25_only_via_sqlite(
+        "shared token",
+        str(tmp_path),
+        max_candidates=1,
+        collection_name="custom_drawers",
+    )
+
+    assert out["total_before_filter"] == 1
+    assert out["results"][0]["wing"] == "custom"
+
+
+def test_bm25_recency_fallback_uses_configured_collection_name(tmp_path):
+    seg = "seg-bm25-custom"
+    _seed_chroma_db(
+        str(tmp_path),
+        sqlite_count=0,
+        segment_id=seg,
+        collection_name="custom_drawers",
+    )
+    _seed_drawers(
+        str(tmp_path),
+        seg,
+        [
+            (
+                "custom collection fallback document",
+                {"wing": "custom", "room": "diary", "source_file": "/x/custom.md"},
+                "d-1",
+            ),
+        ],
+    )
+
+    out = _bm25_only_via_sqlite("a", str(tmp_path), collection_name="custom_drawers")
+
+    assert out["total_before_filter"] == 1
+    assert out["results"][0]["wing"] == "custom"
+
+
+def test_bm25_id_ordered_fallback_uses_configured_collection_name(tmp_path):
+    db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE collections (id TEXT PRIMARY KEY, name TEXT NOT NULL);
+            CREATE TABLE segments (id TEXT PRIMARY KEY, collection TEXT NOT NULL, scope TEXT NOT NULL);
+            CREATE TABLE embeddings (
+                id INTEGER PRIMARY KEY,
+                segment_id TEXT NOT NULL,
+                embedding_id TEXT NOT NULL,
+                seq_id BLOB NOT NULL
+            );
+            CREATE TABLE embedding_metadata (
+                id INTEGER REFERENCES embeddings(id),
+                key TEXT NOT NULL,
+                string_value TEXT,
+                int_value INTEGER,
+                float_value REAL,
+                bool_value INTEGER,
+                PRIMARY KEY (id, key)
+            );
+            CREATE VIRTUAL TABLE embedding_fulltext_search
+                USING fts5(string_value, tokenize='trigram');
+            """
+        )
+        conn.execute("INSERT INTO collections (id, name) VALUES ('col-custom', 'custom_drawers')")
+        conn.execute(
+            "INSERT INTO segments (id, collection, scope) VALUES ('seg-custom', 'col-custom', 'VECTOR')"
+        )
+        conn.execute(
+            """INSERT INTO embeddings (id, segment_id, embedding_id, seq_id)
+               VALUES (1, 'seg-custom', 'd-1', ?)""",
+            (b"\x00" * 8,),
+        )
+        conn.execute(
+            """INSERT INTO embedding_metadata (id, key, string_value)
+               VALUES (1, 'chroma:document', 'custom id fallback document')"""
+        )
+        conn.execute(
+            """INSERT INTO embedding_metadata (id, key, string_value)
+               VALUES (1, 'wing', 'custom')"""
+        )
+        conn.execute(
+            """INSERT INTO embedding_metadata (id, key, string_value)
+               VALUES (1, 'room', 'diary')"""
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = _bm25_only_via_sqlite("a", str(tmp_path), collection_name="custom_drawers")
+
+    assert out["total_before_filter"] == 1
+    assert out["results"][0]["wing"] == "custom"
+
+
 def test_bm25_fallback_no_palace(tmp_path):
     out = _bm25_only_via_sqlite("anything", str(tmp_path))
     assert "error" in out
@@ -473,6 +700,7 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     # MempalaceConfig.
     class _Cfg:
         palace_path = str(palace_with_drawers)
+        collection_name = COLLECTION
 
     monkeypatch.setattr(mcp_server, "_config", _Cfg())
     monkeypatch.setattr(mcp_server, "_vector_disabled", True)
@@ -486,3 +714,46 @@ def test_tool_status_via_sqlite_returns_breakdown(palace_with_drawers, monkeypat
     # ops×2 (incident + repair runbook), design×1 (metaphor).
     assert out["wings"].get("ops") == 2
     assert out["wings"].get("design") == 1
+
+
+def test_tool_status_via_sqlite_uses_configured_collection(tmp_path, monkeypatch):
+    """The vector-disabled status fallback must match the configured collection."""
+    from mempalace import mcp_server
+
+    default_seg = "seg-default"
+    custom_seg = "seg-custom"
+    _seed_chroma_db(str(tmp_path), sqlite_count=0, segment_id=default_seg)
+    db_path = os.path.join(str(tmp_path), "chroma.sqlite3")
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO collections (id, name) VALUES (?, ?)",
+            ("col-custom", "custom_drawers"),
+        )
+        conn.execute(
+            "INSERT INTO segments (id, collection, scope) VALUES (?, ?, 'VECTOR')",
+            (custom_seg, "col-custom"),
+        )
+    _seed_drawers(
+        str(tmp_path),
+        custom_seg,
+        [
+            (
+                "configured collection drawer",
+                {"wing": "custom", "room": "status", "source_file": "/x/custom.md"},
+                "d-custom",
+            ),
+        ],
+    )
+
+    class _Cfg:
+        palace_path = str(tmp_path)
+        collection_name = "custom_drawers"
+
+    monkeypatch.setattr(mcp_server, "_config", _Cfg())
+    monkeypatch.setattr(mcp_server, "_vector_disabled", True)
+    monkeypatch.setattr(mcp_server, "_vector_disabled_reason", "test divergence")
+
+    out = mcp_server._tool_status_via_sqlite()
+    assert out["total_drawers"] == 1
+    assert out["wings"] == {"custom": 1}
+    assert out["rooms"] == {"status": 1}

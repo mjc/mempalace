@@ -54,6 +54,16 @@ def _get_palace_path():
         return default
 
 
+def _get_collection_name() -> str:
+    """Resolve drawers collection name from config."""
+    try:
+        from .config import MempalaceConfig
+
+        return MempalaceConfig().collection_name
+    except Exception:
+        return COLLECTION_NAME
+
+
 def _paginate_ids(col, where=None):
     """Pull all IDs in a collection using pagination."""
     ids = []
@@ -83,7 +93,7 @@ def _paginate_ids(col, where=None):
     return ids
 
 
-def scan_palace(palace_path=None, only_wing=None):
+def scan_palace(palace_path=None, only_wing=None, collection_name: Optional[str] = None):
     """Scan the palace for corrupt/unfetchable IDs.
 
     Probes in batches of 100, falls back to per-ID on failure.
@@ -92,14 +102,15 @@ def scan_palace(palace_path=None, only_wing=None):
     Returns (good_set, bad_set).
     """
     palace_path = palace_path or _get_palace_path()
+    collection_name = collection_name or _get_collection_name()
     print(f"\n  Palace: {palace_path}")
     print("  Loading...")
 
-    col = ChromaBackend().get_collection(palace_path, COLLECTION_NAME)
+    col = ChromaBackend().get_collection(palace_path, collection_name)
 
     where = {"wing": only_wing} if only_wing else None
     total = col.count()
-    print(f"  Collection: {COLLECTION_NAME}, total: {total:,}")
+    print(f"  Collection: {collection_name}, total: {total:,}")
     if only_wing:
         print(f"  Scanning wing: {only_wing}")
 
@@ -160,9 +171,10 @@ def scan_palace(palace_path=None, only_wing=None):
     return good_set, bad_set
 
 
-def prune_corrupt(palace_path=None, confirm=False):
+def prune_corrupt(palace_path=None, confirm=False, collection_name: Optional[str] = None):
     """Delete corrupt IDs listed in corrupt_ids.txt."""
     palace_path = palace_path or _get_palace_path()
+    collection_name = collection_name or _get_collection_name()
     bad_file = os.path.join(palace_path, "corrupt_ids.txt")
 
     if not os.path.exists(bad_file):
@@ -178,7 +190,7 @@ def prune_corrupt(palace_path=None, confirm=False):
         print("  Re-run with --confirm to actually delete.")
         return
 
-    col = ChromaBackend().get_collection(palace_path, COLLECTION_NAME)
+    col = ChromaBackend().get_collection(palace_path, collection_name)
     before = col.count()
     print(f"  Collection size before: {before:,}")
 
@@ -232,7 +244,10 @@ class TruncationDetected(Exception):
 
 
 def check_extraction_safety(
-    palace_path: str, extracted: int, confirm_truncation_ok: bool = False
+    palace_path: str,
+    extracted: int,
+    confirm_truncation_ok: bool = False,
+    collection_name: Optional[str] = None,
 ) -> None:
     """Cross-check that ``extracted`` matches the SQLite ground truth.
 
@@ -254,7 +269,8 @@ def check_extraction_safety(
     if confirm_truncation_ok:
         return
 
-    sqlite_count = sqlite_drawer_count(palace_path)
+    collection_name = collection_name or _get_collection_name()
+    sqlite_count = sqlite_drawer_count(palace_path, collection_name)
     cap_signal = extracted == CHROMADB_DEFAULT_GET_LIMIT
 
     if sqlite_count is not None and sqlite_count > extracted:
@@ -290,7 +306,9 @@ def check_extraction_safety(
         raise TruncationDetected(message, sqlite_count, extracted)
 
 
-def sqlite_drawer_count(palace_path: str) -> "int | None":
+def sqlite_drawer_count(
+    palace_path: str, collection_name: Optional[str] = None
+) -> "int | None":
     """Count rows in ``chroma.sqlite3.embeddings`` for the drawers collection.
 
     Used as an independent ground-truth check against the chromadb
@@ -302,6 +320,7 @@ def sqlite_drawer_count(palace_path: str) -> "int | None":
     drift, missing tables, locked file). Callers treat ``None`` as
     "unknown" and fall back to the cap-detection check.
     """
+    collection_name = collection_name or _get_collection_name()
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
     if not os.path.exists(sqlite_path):
         return None
@@ -318,7 +337,7 @@ def sqlite_drawer_count(palace_path: str) -> "int | None":
                 JOIN collections c ON s.collection = c.id
                 WHERE c.name = ?
                 """,
-                (COLLECTION_NAME,),
+                (collection_name,),
             ).fetchone()
             return int(row[0]) if row and row[0] is not None else None
         finally:
@@ -330,7 +349,11 @@ def sqlite_drawer_count(palace_path: str) -> "int | None":
         return None
 
 
-def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
+def rebuild_index(
+    palace_path=None,
+    confirm_truncation_ok: bool = False,
+    collection_name: Optional[str] = None,
+):
     """Rebuild the HNSW index from scratch.
 
     1. Extract all drawers via ChromaDB get()
@@ -345,6 +368,7 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
     (typically only a concern for palaces sized at exactly 10 000 rows).
     """
     palace_path = palace_path or _get_palace_path()
+    collection_name = collection_name or _get_collection_name()
 
     if not os.path.isdir(palace_path):
         print(f"\n  No palace found at {palace_path}")
@@ -357,7 +381,7 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
 
     backend = ChromaBackend()
     try:
-        col = backend.get_collection(palace_path, COLLECTION_NAME)
+        col = backend.get_collection(palace_path, collection_name)
         total = col.count()
     except Exception as e:
         print(f"  Error reading palace: {e}")
@@ -392,7 +416,12 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
     # short of the SQLite ground truth (or when extraction == chromadb
     # default get() cap and the SQLite check couldn't run).
     try:
-        check_extraction_safety(palace_path, len(all_ids), confirm_truncation_ok)
+        check_extraction_safety(
+            palace_path,
+            len(all_ids),
+            confirm_truncation_ok,
+            collection_name=collection_name,
+        )
     except TruncationDetected as e:
         print(e.message)
         return
@@ -407,8 +436,8 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
 
     # Rebuild with correct HNSW settings
     print("  Rebuilding collection with hnsw:space=cosine...")
-    backend.delete_collection(palace_path, COLLECTION_NAME)
-    new_col = backend.create_collection(palace_path, COLLECTION_NAME)
+    backend.delete_collection(palace_path, collection_name)
+    new_col = backend.create_collection(palace_path, collection_name)
 
     filed = 0
     try:
@@ -424,7 +453,7 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
         print(f"  Only {filed}/{len(all_ids)} drawers were re-filed.")
         if os.path.exists(backup_path):
             print(f"  Restoring from backup: {backup_path}")
-            backend.delete_collection(palace_path, COLLECTION_NAME)
+            backend.delete_collection(palace_path, collection_name)
             shutil.copy2(backup_path, sqlite_path)
             print("  Backup restored. Palace is back to pre-repair state.")
         else:
@@ -436,7 +465,7 @@ def rebuild_index(palace_path=None, confirm_truncation_ok: bool = False):
     print(f"\n{'=' * 55}\n")
 
 
-def status(palace_path=None) -> dict:
+def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     """Read-only health check: compare sqlite vs HNSW element counts.
 
     Catches the #1222 failure mode where chromadb's HNSW segment freezes
@@ -454,6 +483,7 @@ def status(palace_path=None) -> dict:
     ``status="unknown"`` when no palace exists at the given path.
     """
     palace_path = palace_path or _get_palace_path()
+    collection_name = collection_name or _get_collection_name()
     print(f"\n{'=' * 55}")
     print("  MemPalace Repair — Status")
     print(f"{'=' * 55}\n")
@@ -463,7 +493,7 @@ def status(palace_path=None) -> dict:
         print("  No palace found.\n")
         return {"status": "unknown", "message": "no palace at path"}
 
-    drawers = hnsw_capacity_status(palace_path, "mempalace_drawers")
+    drawers = hnsw_capacity_status(palace_path, collection_name)
     closets = hnsw_capacity_status(palace_path, "mempalace_closets")
 
     for label, info in (("drawers", drawers), ("closets", closets)):

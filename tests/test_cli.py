@@ -752,6 +752,7 @@ def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
     palace_dir.mkdir()
     (palace_dir / "chroma.sqlite3").write_text("db")
     mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "custom_drawers"
     args = argparse.Namespace(palace=None, yes=True)
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -762,11 +763,51 @@ def test_cmd_repair_success(mock_config_cls, tmp_path, capsys):
     }
     mock_new_col = MagicMock()
     mock_backend = _mock_backend_for(col=mock_col, new_col=mock_new_col)
-    with patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend):
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("mempalace.repair.sqlite_drawer_count", return_value=2) as mock_sqlite_count,
+    ):
         cmd_repair(args)
     out = capsys.readouterr().out
     assert "Repair complete" in out
     assert "2 drawers rebuilt" in out
+    mock_backend.get_collection.assert_called_once_with(str(palace_dir), "custom_drawers")
+    mock_sqlite_count.assert_called_once_with(str(palace_dir), "custom_drawers")
+    mock_backend.delete_collection.assert_called_once_with(str(palace_dir), "custom_drawers")
+    mock_backend.create_collection.assert_called_once_with(str(palace_dir), "custom_drawers")
+
+
+@patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_restores_backup_on_rebuild_failure(mock_config_cls, tmp_path, capsys):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    (palace_dir / "chroma.sqlite3").write_text("db")
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "custom_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_new_col = MagicMock()
+    mock_new_col.add.side_effect = RuntimeError("boom")
+    mock_backend = _mock_backend_for(col=mock_col, new_col=mock_new_col)
+    with (
+        patch("mempalace.backends.chroma.ChromaBackend", return_value=mock_backend),
+        patch("mempalace.migrate.confirm_destructive_action", return_value=True),
+        patch("mempalace.repair._close_chroma_handles") as mock_close_handles,
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            cmd_repair(args)
+    out = capsys.readouterr().out
+    assert exc_info.value.code == 1
+    assert "ERROR during rebuild" in out
+    assert "Backup restored" in out
+    mock_backend.close_palace.assert_called_once_with(str(palace_dir))
+    mock_close_handles.assert_called_once_with(str(palace_dir))
 
 
 @patch("mempalace.cli.MempalaceConfig")

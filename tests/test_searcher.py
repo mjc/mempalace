@@ -84,6 +84,32 @@ class TestSearchMemories:
         assert "error" in result
         assert "query failed" in result["error"]
 
+    def test_search_memories_vector_path_uses_explicit_collection_name(self):
+        mock_col = MagicMock()
+        mock_col.query.return_value = {
+            "ids": [["drawer_custom"]],
+            "documents": [["custom collection text"]],
+            "metadatas": [[{"wing": "project", "room": "backend", "source_file": "x.py"}]],
+            "distances": [[0.1]],
+        }
+
+        with (
+            patch("mempalace.searcher.get_collection", return_value=mock_col) as get_collection,
+            patch("mempalace.searcher.get_closets_collection", side_effect=RuntimeError("no closets")),
+        ):
+            result = search_memories(
+                "test",
+                "/fake/path",
+                collection_name="custom_drawers",
+            )
+
+        get_collection.assert_called_once_with(
+            "/fake/path",
+            collection_name="custom_drawers",
+            create=False,
+        )
+        assert result["results"][0]["text"] == "custom collection text"
+
     def test_search_memories_filters_in_result(self, palace_path, seeded_collection):
         result = search_memories("test", palace_path, wing="project", room="backend")
         assert result["filters"]["wing"] == "project"
