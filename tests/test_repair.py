@@ -522,6 +522,42 @@ def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_shuti
 
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_allows_concurrent_live_writes_after_recreate(
+    mock_backend_cls, mock_shutil, tmp_path, capsys
+):
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    sqlite_path.write_text("fake")
+
+    def _fake_copy2(src, dst):
+        with open(dst, "w") as handle:
+            handle.write("backup")
+
+    mock_shutil.copy2.side_effect = _fake_copy2
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+    mock_temp_col = MagicMock()
+    mock_temp_col.count.return_value = 2
+    mock_new_col = MagicMock()
+    mock_new_col.count.return_value = 4
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+    mock_backend.create_collection.side_effect = [mock_temp_col, mock_new_col]
+
+    repair.rebuild_index(palace_path=str(tmp_path))
+
+    out = capsys.readouterr().out
+    assert "expected at least 2" in out
+    assert "Concurrent writes landed during repair and were preserved" in out
+    assert mock_shutil.copy2.call_count == 1
+
+
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_live_delete_missing_still_restores_backup(
     mock_backend_cls, mock_shutil, tmp_path
 ):

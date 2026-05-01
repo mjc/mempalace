@@ -102,8 +102,20 @@ def _extract_drawers(col, total: int, batch_size: int):
     return all_ids, all_docs, all_metas
 
 
-def _verify_collection_count(col, expected: int, label: str) -> None:
+def _verify_collection_count(col, expected: int, label: str, *, allow_extra: bool = False) -> None:
     actual = col.count()
+    if allow_extra and actual >= expected:
+        if actual > expected:
+            # Short-term race tolerance: MemPalace-controlled writers can still
+            # add drawers while repair is running. Extra rows mean those writes
+            # survived the live rebuild, so do not roll back a successful repair.
+            # This is not a substitute for a cooperative application-level
+            # palace write lock shared by repair, MCP writes, hooks, and miners.
+            print(
+                f"  {label} count is {actual}; expected at least {expected}. "
+                "Concurrent writes landed during repair and were preserved."
+            )
+        return
     if actual != expected:
         raise RuntimeError(f"{label} count mismatch: expected {expected}, got {actual}")
 
@@ -173,7 +185,7 @@ def _rebuild_collection_via_temp(
             new_col.upsert(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
             rebuilt += len(batch_ids)
             progress(f"  Re-filed {rebuilt}/{expected} drawers...")
-        _verify_collection_count(new_col, expected, "rebuilt live collection")
+        _verify_collection_count(new_col, expected, "rebuilt live collection", allow_extra=True)
 
         try:
             _delete_collection_if_exists(backend, palace_path, temp_name)
