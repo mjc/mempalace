@@ -30,30 +30,9 @@ from .palace import (
     purge_file_closets,
     upsert_closet_lines,
 )
+from .readable_extensions import MINER_READABLE_EXTENSIONS
 
-READABLE_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".py",
-    ".js",
-    ".ts",
-    ".jsx",
-    ".tsx",
-    ".json",
-    ".jsonl",
-    ".yaml",
-    ".yml",
-    ".html",
-    ".css",
-    ".java",
-    ".go",
-    ".rs",
-    ".rb",
-    ".sh",
-    ".csv",
-    ".sql",
-    ".toml",
-}
+READABLE_EXTENSIONS = MINER_READABLE_EXTENSIONS
 
 SKIP_FILENAMES = {
     "entities.json",
