@@ -99,6 +99,16 @@ def _get_palace_path():
         return default
 
 
+def _get_collection_name() -> str:
+    """Resolve drawers collection name from config."""
+    try:
+        from .config import get_configured_collection_name
+
+        return get_configured_collection_name()
+    except Exception:
+        return COLLECTION_NAME
+
+
 def _paginate_ids(col, where=None):
     """Pull all IDs in a collection using pagination."""
     ids = []
@@ -601,8 +611,6 @@ def maybe_repair_poisoned_max_seq_id_before_rebuild(
         dry_run=dry_run,
         assume_yes=assume_yes,
     )
-
-
 def rebuild_index(
     palace_path=None,
     confirm_truncation_ok: bool = False,
@@ -1103,8 +1111,6 @@ def rebuild_from_sqlite(
         return counts
     finally:
         backend.close()
-
-
 def status(palace_path=None, collection_name: Optional[str] = None) -> dict:
     """Read-only health check: compare sqlite vs HNSW element counts.
 
