@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import threading
+import time
 from typing import Optional
 
 from .backends.chroma import ChromaBackend
@@ -319,8 +320,8 @@ def mine_lock(source_file: str):
         lf.close()
 
 
-class MineAlreadyRunning(RuntimeError):
-    """Raised when another `mempalace mine` already holds the per-palace lock."""
+class PalaceWriteAlreadyRunning(RuntimeError):
+    """Raised when another writer already holds the per-palace write lock."""
 
 
 # Per-thread record of palaces this thread already holds the lock for. Used by
@@ -365,8 +366,8 @@ def _mark_released(lock_key: str) -> None:
 
 
 @contextlib.contextmanager
-def mine_palace_lock(palace_path: str):
-    """Per-palace non-blocking lock around the full `mine` pipeline.
+def palace_write_lock(palace_path: str, *, operation: str = "write", blocking: bool = False):
+    """Per-palace lock around palace write operations.
 
     The per-file `mine_lock` only protects delete+insert interleave for a
     single source; it does not prevent N copies of `mempalace mine <dir>`
@@ -385,9 +386,11 @@ def mine_palace_lock(palace_path: str):
     normcase, `C:\\Palace` and `c:\\palace` would hash to different keys
     on Windows and let two concurrent mines touch the same on-disk palace.
 
-    Non-blocking: if another `mine` is already writing to this palace,
-    raise MineAlreadyRunning so the caller can exit cleanly instead of
-    piling up as a waiting worker.
+    By default this is non-blocking: if another operation is already writing
+    to this palace, raise PalaceWriteAlreadyRunning so callers like repair can
+    exit cleanly. Callers that are normal background writers, such as MCP
+    tools, may pass ``blocking=True`` to wait for the existing writer and then
+    serialize their write behind it.
 
     Re-entrant: if the current thread already holds the lock for the same
     palace, the context manager passes through without re-acquiring. This
@@ -414,21 +417,33 @@ def mine_palace_lock(palace_path: str):
             import msvcrt
 
             try:
-                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                acquired = True
+                if blocking:
+                    while True:
+                        try:
+                            msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
+                            acquired = True
+                            break
+                        except OSError:
+                            time.sleep(0.05)
+                else:
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
             except OSError as exc:
-                raise MineAlreadyRunning(
-                    f"another `mempalace mine` is already running against {resolved}"
+                raise PalaceWriteAlreadyRunning(
+                    f"another palace writer is already running against {resolved}; "
+                    f"refusing `{operation}`"
                 ) from exc
         else:
             import fcntl
 
             try:
-                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                flags = fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB
+                fcntl.flock(lf, flags)
                 acquired = True
             except BlockingIOError as exc:
-                raise MineAlreadyRunning(
-                    f"another `mempalace mine` is already running against {resolved}"
+                raise PalaceWriteAlreadyRunning(
+                    f"another palace writer is already running against {resolved}; "
+                    f"refusing `{operation}`"
                 ) from exc
         _mark_held(palace_key)
         try:
@@ -449,6 +464,20 @@ def mine_palace_lock(palace_path: str):
             except Exception:
                 pass
         lf.close()
+
+
+class MineAlreadyRunning(PalaceWriteAlreadyRunning):
+    """Raised when another writer already holds the per-palace lock."""
+
+
+@contextlib.contextmanager
+def mine_palace_lock(palace_path: str):
+    """Per-palace non-blocking lock around the full `mine` pipeline."""
+    try:
+        with palace_write_lock(palace_path, operation="mine"):
+            yield
+    except PalaceWriteAlreadyRunning as exc:
+        raise MineAlreadyRunning(str(exc)) from exc
 
 
 # Backward-compatible alias (previous patch iteration used a single global
