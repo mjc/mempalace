@@ -1149,6 +1149,29 @@ def test_cmd_repair_releases_write_lock_on_backup_failure(mock_config_cls, tmp_p
 
 
 @patch("mempalace.cli.MempalaceConfig")
+def test_cmd_repair_releases_write_lock_when_backend_init_fails(mock_config_cls, tmp_path):
+    palace_dir = tmp_path / "palace"
+    palace_dir.mkdir()
+    sqlite3.connect(str(palace_dir / "chroma.sqlite3")).close()
+    mock_config_cls.return_value.palace_path = str(palace_dir)
+    mock_config_cls.return_value.collection_name = "mempalace_drawers"
+    args = argparse.Namespace(palace=None, yes=True)
+    lock = MagicMock()
+
+    with (
+        patch("mempalace.repair.sqlite_integrity_errors", return_value=[]),
+        patch("mempalace.palace.palace_write_lock", return_value=lock),
+        patch("mempalace.backends.chroma.ChromaBackend", side_effect=RuntimeError("init failed")),
+        pytest.raises(SystemExit) as excinfo,
+    ):
+        cmd_repair(args)
+
+    assert excinfo.value.code == 1
+    lock.__enter__.assert_called_once_with()
+    lock.__exit__.assert_called_once_with(None, None, None)
+
+
+@patch("mempalace.cli.MempalaceConfig")
 def test_cmd_repair_forwards_audit_content_when_present(mock_config_cls, tmp_path):
     source = tmp_path / "source"
     dest = tmp_path / "dest"

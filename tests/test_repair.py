@@ -3011,6 +3011,21 @@ def test_rebuild_from_sqlite_releases_dest_lock_when_source_lock_active(
     dest_lock.__exit__.assert_called_once_with(None, None, None)
 
 
+def test_rebuild_from_sqlite_releases_lock_on_archive_move_failure(tmp_path, monkeypatch):
+    palace = tmp_path / "palace"
+    _seed_palace(palace, "mempalace_drawers", [("d1", "body", {"wing": "w"})])
+    lock = MagicMock()
+    monkeypatch.setattr(repair, "palace_write_lock", MagicMock(return_value=lock))
+    monkeypatch.setattr(repair.shutil, "move", MagicMock(side_effect=OSError("archive failed")))
+
+    with pytest.raises(OSError, match="archive failed"):
+        repair.rebuild_from_sqlite(str(palace), str(palace), archive_existing_dest=True)
+
+    lock.__enter__.assert_called_once_with()
+    lock.__exit__.assert_called_once_with(None, None, None)
+    assert (palace / "chroma.sqlite3").exists()
+
+
 def test_recoverable_collection_names_orders_primary_and_ignores_empty(tmp_path):
     from mempalace.backends.chroma import ChromaBackend
 

@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import multiprocessing
 import os
+import sys
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
+import mempalace.palace as palace_mod
 from mempalace.palace import (
     MineAlreadyRunning,
     PalaceWriteAlreadyRunning,
@@ -321,3 +325,20 @@ def test_shared_writer_lock_can_wait_for_existing_writer(tmp_path, monkeypatch):
     thread.join(timeout=2)
     assert acquired == ["entered"]
     waiter["cm"].__exit__(None, None, None)
+
+
+def test_shared_writer_lock_windows_blocking_reraises_non_contention_error(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(palace_mod.os, "name", "nt", raising=False)
+    fake_msvcrt = SimpleNamespace(
+        LK_NBLCK=1,
+        LK_UNLCK=2,
+        locking=MagicMock(side_effect=OSError(5, "simulated I/O failure")),
+    )
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+    with pytest.raises(OSError, match="simulated I/O failure"):
+        with palace_write_lock(str(tmp_path / "palace"), operation="mcp add_drawer", blocking=True):
+            pass

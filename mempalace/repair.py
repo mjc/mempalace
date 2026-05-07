@@ -1601,25 +1601,29 @@ def rebuild_from_sqlite(
     if in_place:
         archive_path = _unique_archive_path(dest_palace)
         print(f"  Archiving {dest_palace} → {archive_path}")
-        shutil.move(dest_palace, archive_path)
-        source_palace = archive_path
-        src_db = os.path.join(source_palace, "chroma.sqlite3")
-
-        # In-place only: drop chromadb's process-wide System registry so
-        # the new client at dest_palace builds a fresh System. Without
-        # this, ``create_collection`` raises "Collection already exists"
-        # because the cached System still holds the pre-rename schema.
-        # Cross-palace mode does not need this and would needlessly
-        # invalidate other callers' clients (see docstring warning).
         try:
-            from chromadb.api.client import SharedSystemClient
+            shutil.move(dest_palace, archive_path)
+            source_palace = archive_path
+            src_db = os.path.join(source_palace, "chroma.sqlite3")
 
-            SharedSystemClient.clear_system_cache()
-        except Exception as exc:  # noqa: BLE001
-            print(
-                f"  Warning: could not clear chromadb system cache ({exc!r}); "
-                "in-place rebuild may fail with 'Collection already exists'."
-            )
+            # In-place only: drop chromadb's process-wide System registry so
+            # the new client at dest_palace builds a fresh System. Without
+            # this, ``create_collection`` raises "Collection already exists"
+            # because the cached System still holds the pre-rename schema.
+            # Cross-palace mode does not need this and would needlessly
+            # invalidate other callers' clients (see docstring warning).
+            try:
+                from chromadb.api.client import SharedSystemClient
+
+                SharedSystemClient.clear_system_cache()
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"  Warning: could not clear chromadb system cache ({exc!r}); "
+                    "in-place rebuild may fail with 'Collection already exists'."
+                )
+        except Exception:
+            _release_repair_locks()
+            raise
 
     backend: ChromaBackend | None = None
     counts: dict[str, int] = {}

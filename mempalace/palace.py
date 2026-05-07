@@ -5,6 +5,7 @@ Consolidates collection access patterns used by both miners and the MCP server.
 """
 
 import contextlib
+import errno
 import hashlib
 import logging
 import os
@@ -365,6 +366,15 @@ def _mark_released(lock_key: str) -> None:
     _holder_state().discard(lock_key)
 
 
+def _is_windows_lock_contention(exc: OSError) -> bool:
+    """Return True when msvcrt.locking failed because another writer holds the lock."""
+    return getattr(exc, "winerror", None) in {33, 36} or exc.errno in {
+        errno.EACCES,
+        errno.EAGAIN,
+        errno.EDEADLK,
+    }
+
+
 @contextlib.contextmanager
 def palace_write_lock(palace_path: str, *, operation: str = "write", blocking: bool = False):
     """Per-palace lock around palace write operations.
@@ -416,23 +426,27 @@ def palace_write_lock(palace_path: str, *, operation: str = "write", blocking: b
         if os.name == "nt":
             import msvcrt
 
-            try:
-                if blocking:
-                    while True:
-                        try:
-                            msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
-                            acquired = True
-                            break
-                        except OSError:
-                            time.sleep(0.05)
-                else:
+            if blocking:
+                while True:
+                    try:
+                        msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
+                        acquired = True
+                        break
+                    except OSError as exc:
+                        if not _is_windows_lock_contention(exc):
+                            raise
+                        time.sleep(0.05)
+            else:
+                try:
                     msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
                     acquired = True
-            except OSError as exc:
-                raise PalaceWriteAlreadyRunning(
-                    f"another palace writer is already running against {resolved}; "
-                    f"refusing `{operation}`"
-                ) from exc
+                except OSError as exc:
+                    if not _is_windows_lock_contention(exc):
+                        raise
+                    raise PalaceWriteAlreadyRunning(
+                        f"another palace writer is already running against {resolved}; "
+                        f"refusing `{operation}`"
+                    ) from exc
         else:
             import fcntl
 
